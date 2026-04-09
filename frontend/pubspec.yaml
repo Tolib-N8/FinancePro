@@ -51,6 +51,16 @@ dev_dependencies:
   json_serializable: ^6.8.0
   riverpod_generator: ^2.4.0
   flutter_lints: ^4.0.0
+  msix: ^3.16.7
 
 flutter:
   uses-material-design: true
+
+msix_config:
+  display_name: FinancePro
+  publisher_display_name: Tolib
+  identity_name: com.financepro.app
+  msix_version: 1.0.0.0
+  description: Personal finance tracking platform with AI
+  capabilities: internetClient
+  install_certificate: false
