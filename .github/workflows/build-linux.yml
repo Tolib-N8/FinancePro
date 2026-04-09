@@ -1,0 +1,89 @@
+name: Build Linux
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libstdc++-12-dev \
+            libglib2.0-dev libpango1.0-dev libcairo2-dev \
+            fuse libfuse2 wget imagemagick
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+
+      - name: Install Flutter dependencies
+        working-directory: frontend
+        run: flutter pub get
+
+      - name: Build Linux release
+        working-directory: frontend
+        run: flutter build linux --release
+
+      - name: Download appimagetool
+        run: |
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            -O /usr/local/bin/appimagetool
+          chmod +x /usr/local/bin/appimagetool
+
+      - name: Create AppImage
+        run: |
+          BUILD="frontend/build/linux/x64/release/bundle"
+          APPDIR="AppDir"
+          mkdir -p "$APPDIR/usr/bin"
+          cp -r "$BUILD/." "$APPDIR/usr/bin/"
+          cat > "$APPDIR/financepro.desktop" << 'DESKTOP'
+          [Desktop Entry]
+          Name=FinancePro
+          Exec=financepro
+          Icon=financepro
+          Type=Application
+          Categories=Finance;
+          DESKTOP
+          cat > "$APPDIR/AppRun" << 'APPRUN'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/financepro" "$@"
+          APPRUN
+          chmod +x "$APPDIR/AppRun"
+          convert -size 256x256 xc:#1976D2 -fill white -gravity Center \
+            -pointsize 72 -annotate 0 "FP" "$APPDIR/financepro.png"
+          ARCH=x86_64 appimagetool "$APPDIR" \
+            "FinancePro-${{ github.ref_name }}-linux-x86_64.AppImage"
+
+      - name: Create TAR.GZ
+        run: |
+          tar -czf "FinancePro-${{ github.ref_name }}-linux-x64.tar.gz" \
+            -C "frontend/build/linux/x64/release/bundle" .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FinancePro-Linux-${{ github.ref_name }}
+          path: |
+            FinancePro-*-linux*.AppImage
+            FinancePro-*-linux*.tar.gz
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            FinancePro-*-linux*.AppImage
+            FinancePro-*-linux*.tar.gz
