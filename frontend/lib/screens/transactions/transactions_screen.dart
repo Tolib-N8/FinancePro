@@ -1,7 +1,12 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:path_provider/path_provider.dart';
 
+import '../../core/api/endpoints.dart';
+import '../../providers/api_client_provider.dart';
 import '../../providers/transaction_provider.dart';
 import 'widgets/transaction_tile.dart';
 
@@ -16,6 +21,36 @@ class _TransactionsScreenState extends ConsumerState<TransactionsScreen> {
   String? _typeFilter;
   String? _search;
   final _searchController = TextEditingController();
+  bool _exporting = false;
+
+  Future<void> _exportCsv(BuildContext context) async {
+    setState(() => _exporting = true);
+    try {
+      final client = await ref.read(apiClientProvider.future);
+      final response = await client.get(
+        Endpoints.exportCsv,
+        queryParameters: {
+          if (_typeFilter != null) 'type': _typeFilter,
+        },
+      );
+      final dir = await getDownloadsDirectory() ?? await getApplicationDocumentsDirectory();
+      final file = File('${dir.path}/financepro_export.csv');
+      await file.writeAsString(response.data.toString());
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Saved to ${file.path}')),
+        );
+      }
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Export failed: $e')),
+        );
+      }
+    } finally {
+      setState(() => _exporting = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -25,6 +60,18 @@ class _TransactionsScreenState extends ConsumerState<TransactionsScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Transactions'),
+        actions: [
+          _exporting
+              ? const Padding(
+                  padding: EdgeInsets.all(12),
+                  child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
+                )
+              : IconButton(
+                  icon: const Icon(Icons.download),
+                  tooltip: 'Export CSV',
+                  onPressed: () => _exportCsv(context),
+                ),
+        ],
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(100),
           child: Padding(

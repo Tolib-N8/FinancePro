@@ -3,7 +3,7 @@ import httpx
 from app.config import settings
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-FLASH = "gemini-1.5-flash"
+FLASH = "gemini-2.5-flash"
 
 
 def gemini_url(model: str, action: str) -> str:
@@ -11,7 +11,9 @@ def gemini_url(model: str, action: str) -> str:
 
 
 async def generate(prompt: str | list, model: str = FLASH, max_tokens: int = 512, temperature: float = 0) -> str:
-    """Simple text (or multimodal) generation. Returns response text."""
+    """Simple text (or multimodal) generation. Returns response text.
+    Thinking is disabled for deterministic JSON/text extraction tasks.
+    """
     if isinstance(prompt, str):
         contents = [{"parts": [{"text": prompt}]}]
     else:
@@ -19,18 +21,26 @@ async def generate(prompt: str | list, model: str = FLASH, max_tokens: int = 512
 
     body = {
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature},
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": temperature,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
     }
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(gemini_url(model, "generateContent"), json=body)
         r.raise_for_status()
         data = r.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        parts = data["candidates"][0].get("content", {}).get("parts", [])
+        if not parts:
+            return ""
+        return parts[0].get("text", "")
 
 
 async def stream_generate(messages: list[dict], system: str, model: str = FLASH):
-    """Streaming chat. Yields text chunks. messages = [{role, content}, ...]"""
-    # Convert to Gemini format (user/model alternating)
+    """Streaming chat. Yields text chunks. messages = [{role, content}, ...]
+    Thinking is enabled with a separate budget so maxOutputTokens is fully available for text.
+    """
     contents = []
     for m in messages:
         role = "user" if m["role"] == "user" else "model"
@@ -39,7 +49,11 @@ async def stream_generate(messages: list[dict], system: str, model: str = FLASH)
     body = {
         "system_instruction": {"parts": [{"text": system}]},
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.7},
+        "generationConfig": {
+            "maxOutputTokens": 2048,
+            "temperature": 0.7,
+            "thinkingConfig": {"thinkingBudget": 1024},
+        },
     }
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream(
@@ -51,8 +65,10 @@ async def stream_generate(messages: list[dict], system: str, model: str = FLASH)
                     import json
                     try:
                         chunk = json.loads(line[6:])
-                        text = chunk["candidates"][0]["content"]["parts"][0].get("text", "")
-                        if text:
-                            yield text
+                        parts = chunk["candidates"][0].get("content", {}).get("parts", [])
+                        if parts:
+                            text = parts[0].get("text", "")
+                            if text:
+                                yield text
                     except Exception:
                         pass

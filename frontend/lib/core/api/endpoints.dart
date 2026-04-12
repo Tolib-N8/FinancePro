@@ -25,6 +25,9 @@ class Endpoints {
   static String chatMessages(String id) => '/api/v1/chat/sessions/$id/messages';
   static String sendChatMessage(String id) => '/api/v1/chat/sessions/$id/message';
 
+  static const String exportCsv = '/api/v1/admin/export/csv';
+  static const String fixAmountBase = '/api/v1/admin/fix-amount-base';
+
   static const String exchangeRates = '/api/v1/exchange/rates';
   static const String exchangeConvert = '/api/v1/exchange/convert';
 

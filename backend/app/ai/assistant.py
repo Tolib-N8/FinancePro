@@ -25,12 +25,14 @@ async def _build_financial_snapshot(db: AsyncSession) -> str:
     accounts_summary = " | ".join(f"{a.name}: {float(a.balance):.2f} {a.currency}" for a in accounts)
     total_net_worth = sum(float(a.balance) for a in accounts)
 
+    base_amount = func.coalesce(Transaction.amount_base, Transaction.amount)
+
     income_q = await db.execute(
-        select(func.coalesce(func.sum(Transaction.amount), 0))
+        select(func.coalesce(func.sum(base_amount), 0))
         .where(Transaction.type == "income", Transaction.date >= first_day)
     )
     expense_q = await db.execute(
-        select(func.coalesce(func.sum(Transaction.amount), 0))
+        select(func.coalesce(func.sum(base_amount), 0))
         .where(Transaction.type == "expense", Transaction.date >= first_day)
     )
     income = float(income_q.scalar())

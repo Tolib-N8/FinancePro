@@ -150,6 +150,7 @@ class _PinCard extends ConsumerStatefulWidget {
 
 class _PinCardState extends ConsumerState<_PinCard> {
   bool? _hasPin;
+  int _autoLockMinutes = 5;
 
   @override
   void initState() {
@@ -159,7 +160,8 @@ class _PinCardState extends ConsumerState<_PinCard> {
 
   Future<void> _refresh() async {
     final has = await ref.read(lockProvider.notifier).hasPin();
-    if (mounted) setState(() => _hasPin = has);
+    final minutes = await ref.read(lockProvider.notifier).getAutoLockMinutes();
+    if (mounted) setState(() { _hasPin = has; _autoLockMinutes = minutes; });
   }
 
   Future<void> _showPinDialog({
@@ -299,6 +301,35 @@ class _PinCardState extends ConsumerState<_PinCard> {
                 ],
               ],
             ),
+            if (_hasPin!) ...[
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  const Icon(Icons.timer_outlined, size: 18),
+                  const SizedBox(width: 8),
+                  const Text('Auto-lock after:'),
+                  const SizedBox(width: 8),
+                  DropdownButton<int>(
+                    value: _autoLockMinutes,
+                    isDense: true,
+                    items: const [
+                      DropdownMenuItem(value: 0, child: Text('Off')),
+                      DropdownMenuItem(value: 1, child: Text('1 min')),
+                      DropdownMenuItem(value: 3, child: Text('3 min')),
+                      DropdownMenuItem(value: 5, child: Text('5 min')),
+                      DropdownMenuItem(value: 10, child: Text('10 min')),
+                      DropdownMenuItem(value: 15, child: Text('15 min')),
+                      DropdownMenuItem(value: 30, child: Text('30 min')),
+                    ],
+                    onChanged: (v) async {
+                      if (v == null) return;
+                      await ref.read(lockProvider.notifier).setAutoLockMinutes(v);
+                      setState(() => _autoLockMinutes = v);
+                    },
+                  ),
+                ],
+              ),
+            ],
           ],
         ),
       ),

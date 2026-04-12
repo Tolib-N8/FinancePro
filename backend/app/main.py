@@ -28,6 +28,7 @@ async def health_check():
 # Routers — registered after imports to avoid circular deps
 from app.routers import (  # noqa: E402
     accounts,
+    admin,
     analytics,
     categories,
     chat,
@@ -43,3 +44,4 @@ app.include_router(receipts.router, prefix="/api/v1/receipts", tags=["receipts"]
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
 app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["analytics"])
 app.include_router(exchange.router, prefix="/api/v1/exchange", tags=["exchange"])
+app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])

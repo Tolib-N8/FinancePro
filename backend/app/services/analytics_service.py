@@ -14,12 +14,14 @@ async def get_monthly_summary(db: AsyncSession, month: date) -> dict:
     else:
         last_day = month.replace(month=month.month + 1, day=1) - timedelta(days=1)
 
+    base_amount = func.coalesce(Transaction.amount_base, Transaction.amount)
+
     income_q = await db.execute(
-        select(func.coalesce(func.sum(Transaction.amount), 0))
+        select(func.coalesce(func.sum(base_amount), 0))
         .where(Transaction.type == "income", Transaction.date >= first_day, Transaction.date <= last_day)
     )
     expense_q = await db.execute(
-        select(func.coalesce(func.sum(Transaction.amount), 0))
+        select(func.coalesce(func.sum(base_amount), 0))
         .where(Transaction.type == "expense", Transaction.date >= first_day, Transaction.date <= last_day)
     )
 
@@ -37,12 +39,14 @@ async def get_monthly_summary(db: AsyncSession, month: date) -> dict:
 
 
 async def get_category_breakdown(db: AsyncSession, date_from: date, date_to: date) -> list[dict]:
+    base_amount = func.coalesce(Transaction.amount_base, Transaction.amount)
+
     result = await db.execute(
         select(
             Transaction.category_id,
             Category.name,
             Category.color,
-            func.sum(Transaction.amount).label("total"),
+            func.sum(base_amount).label("total"),
         )
         .join(Category, Transaction.category_id == Category.id, isouter=True)
         .where(
@@ -51,7 +55,7 @@ async def get_category_breakdown(db: AsyncSession, date_from: date, date_to: dat
             Transaction.date <= date_to,
         )
         .group_by(Transaction.category_id, Category.name, Category.color)
-        .order_by(func.sum(Transaction.amount).desc())
+        .order_by(func.sum(base_amount).desc())
     )
 
     rows = result.all()
@@ -74,8 +78,8 @@ async def get_monthly_trend(db: AsyncSession, months: int = 12) -> list[dict]:
     result = await db.execute(text(f"""
         SELECT
             TO_CHAR(date_trunc('month', date), 'YYYY-MM') AS month,
-            SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END) AS income,
-            SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END) AS expenses
+            SUM(CASE WHEN type = 'income' THEN COALESCE(amount_base, amount) ELSE 0 END) AS income,
+            SUM(CASE WHEN type = 'expense' THEN COALESCE(amount_base, amount) ELSE 0 END) AS expenses
         FROM transactions
         WHERE date >= date_trunc('month', CURRENT_DATE) - INTERVAL '{n} months'
         GROUP BY date_trunc('month', date)
@@ -90,7 +94,7 @@ async def get_historical_by_category(db: AsyncSession, months: int = 6) -> dict:
         SELECT
             COALESCE(c.name, 'Uncategorized') AS category_name,
             TO_CHAR(date_trunc('month', t.date), 'YYYY-MM') AS month,
-            SUM(t.amount) AS total
+            SUM(COALESCE(t.amount_base, t.amount)) AS total
         FROM transactions t
         LEFT JOIN categories c ON t.category_id = c.id
         WHERE t.type = 'expense'
