@@ -36,3 +36,11 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Ruflo / agent runtime artifacts (never commit)
+.codex
+*.rvf
+*.rvf.lock
+ruvector.db
+**/ruvector.db
+agentdb.rvf

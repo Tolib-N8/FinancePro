@@ -7,6 +7,11 @@ FLASH = "gemini-2.5-flash"
 
 
 def gemini_url(model: str, action: str) -> str:
+    if not settings.gemini_api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured — set it in .env to use AI features "
+            "(categorization, OCR, chat, forecast, statement import)."
+        )
     return f"{GEMINI_BASE}/{model}:{action}?key={settings.gemini_api_key}"
 
 

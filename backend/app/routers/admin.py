@@ -42,6 +42,7 @@ async def fix_amount_base(db: AsyncSession = DBSession):
 async def export_csv(
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
+    type: Optional[str] = None,
     db: AsyncSession = DBSession,
 ):
     """Export transactions as CSV file."""
@@ -54,6 +55,8 @@ async def export_csv(
         query = query.where(Transaction.date >= date_from)
     if date_to:
         query = query.where(Transaction.date <= date_to)
+    if type:
+        query = query.where(Transaction.type == type)
 
     result = await db.execute(query)
     transactions = list(result.scalars().all())

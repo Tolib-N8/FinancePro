@@ -12,7 +12,7 @@ RUN uv pip install --system \
     "fastapi>=0.115" "uvicorn[standard]>=0.30" \
     "sqlalchemy[asyncio]>=2.0" "asyncpg>=0.29" "alembic>=1.13" \
     "pydantic>=2.7" "pydantic-settings>=2.3" \
-    "anthropic>=0.28" "python-multipart>=0.0.9" \
+    "python-multipart>=0.0.9" \
     "aiofiles>=23.0" "pdf2image>=1.17" "Pillow>=10.0" \
     "httpx>=0.27" "tenacity>=8.3" "python-dateutil>=2.9"
 

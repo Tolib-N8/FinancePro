@@ -1,12 +1,12 @@
 import uuid
-from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account
 from app.models.transaction import Transaction
 from app.schemas.account import AccountCreate, AccountUpdate
+from app.services.exchange_service import convert
 
 
 async def list_accounts(db: AsyncSession) -> list[Account]:
@@ -41,31 +41,33 @@ async def delete_account(db: AsyncSession, account: Account) -> None:
 
 
 async def recalculate_balance(db: AsyncSession, account_id: uuid.UUID) -> float:
-    income_q = await db.execute(
-        select(func.coalesce(func.sum(Transaction.amount), 0))
-        .where(Transaction.account_id == account_id, Transaction.type == "income")
-    )
-    expense_q = await db.execute(
-        select(func.coalesce(func.sum(Transaction.amount), 0))
-        .where(Transaction.account_id == account_id, Transaction.type == "expense")
-    )
-    transfer_in_q = await db.execute(
-        select(func.coalesce(func.sum(Transaction.amount), 0))
-        .where(Transaction.to_account_id == account_id, Transaction.type == "transfer")
-    )
-    transfer_out_q = await db.execute(
-        select(func.coalesce(func.sum(Transaction.amount), 0))
-        .where(Transaction.account_id == account_id, Transaction.type == "transfer")
-    )
+    account = await db.get(Account, account_id)
+    if account is None:
+        raise ValueError("Account not found")
 
-    income = Decimal(str(income_q.scalar()))
-    expenses = Decimal(str(expense_q.scalar()))
-    transfer_in = Decimal(str(transfer_in_q.scalar()))
-    transfer_out = Decimal(str(transfer_out_q.scalar()))
+    result = await db.execute(
+        select(Transaction).where(
+            or_(Transaction.account_id == account_id, Transaction.to_account_id == account_id)
+        )
+    )
+    transactions = list(result.scalars().all())
 
-    balance = float(income - expenses + transfer_in - transfer_out)
-    result = await db.execute(select(Account).where(Account.id == account_id))
-    account = result.scalar_one()
+    balance = 0.0
+    for tx in transactions:
+        amount = float(tx.amount)
+        if tx.currency.upper() != account.currency.upper():
+            amount = await convert(amount, tx.currency, account.currency)
+
+        if tx.type == "income" and tx.account_id == account_id:
+            balance += amount
+        elif tx.type == "expense" and tx.account_id == account_id:
+            balance -= amount
+        elif tx.type == "transfer":
+            if tx.account_id == account_id:
+                balance -= amount
+            if tx.to_account_id == account_id:
+                balance += amount
+
     account.balance = balance
     await db.flush()
     return balance

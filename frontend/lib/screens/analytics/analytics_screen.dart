@@ -2,8 +2,10 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
+import '../../core/api/endpoints.dart';
 import '../../core/utils/currency_formatter.dart';
 import '../../providers/analytics_provider.dart';
+import '../../providers/api_client_provider.dart';
 
 class AnalyticsScreen extends ConsumerStatefulWidget {
   const AnalyticsScreen({super.key});
@@ -129,7 +131,8 @@ class _SummaryCard extends StatelessWidget {
               const SizedBox(height: 8),
               Text(label, style: Theme.of(context).textTheme.bodySmall),
               Text(value,
-                  style: TextStyle(fontWeight: FontWeight.bold, color: color, fontSize: 16)),
+                  style: TextStyle(
+                      fontWeight: FontWeight.bold, color: color, fontSize: 16)),
             ],
           ),
         ),
@@ -160,7 +163,8 @@ class _CategoryTab extends ConsumerWidget {
                   sections: categories.take(8).map((c) {
                     Color color;
                     try {
-                      color = Color(int.parse(c.color.replaceFirst('#', '0xFF')));
+                      color =
+                          Color(int.parse(c.color.replaceFirst('#', '0xFF')));
                     } catch (_) {
                       color = Colors.grey;
                     }
@@ -170,7 +174,9 @@ class _CategoryTab extends ConsumerWidget {
                       title: '${c.percentage.toStringAsFixed(0)}%',
                       radius: 80,
                       titleStyle: const TextStyle(
-                          fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white),
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white),
                     );
                   }).toList(),
                   sectionsSpace: 2,
@@ -191,14 +197,21 @@ class _CategoryTab extends ConsumerWidget {
                                 width: 12,
                                 height: 12,
                                 decoration: BoxDecoration(
-                                  color: Color(int.parse(c.color.replaceFirst('#', '0xFF'))),
+                                  color: Color(int.parse(
+                                      c.color.replaceFirst('#', '0xFF'))),
                                   shape: BoxShape.circle,
                                 ),
                               ),
                               const SizedBox(width: 8),
-                              Expanded(child: Text(c.categoryName, style: const TextStyle(fontSize: 12))),
-                              Text(CurrencyFormatter.formatCompact(c.total, 'USD'),
-                                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                              Expanded(
+                                  child: Text(c.categoryName,
+                                      style: const TextStyle(fontSize: 12))),
+                              Text(
+                                  CurrencyFormatter.formatCompact(
+                                      c.total, 'USD'),
+                                  style: const TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.bold)),
                             ],
                           ),
                         ))
@@ -223,7 +236,9 @@ class _TrendsTab extends ConsumerWidget {
       loading: () => const Center(child: CircularProgressIndicator()),
       error: (e, _) => Center(child: Text('Error: $e')),
       data: (trends) {
-        if (trends.isEmpty) return const Center(child: Text('Not enough data yet'));
+        if (trends.isEmpty) {
+          return const Center(child: Text('Not enough data yet'));
+        }
 
         final maxVal = trends
             .map((t) => t.income > t.expenses ? t.income : t.expenses)
@@ -238,8 +253,10 @@ class _TrendsTab extends ConsumerWidget {
                 return BarChartGroupData(
                   x: e.key,
                   barRods: [
-                    BarChartRodData(toY: e.value.income, color: Colors.green, width: 8),
-                    BarChartRodData(toY: e.value.expenses, color: Colors.red, width: 8),
+                    BarChartRodData(
+                        toY: e.value.income, color: Colors.green, width: 8),
+                    BarChartRodData(
+                        toY: e.value.expenses, color: Colors.red, width: 8),
                   ],
                 );
               }).toList(),
@@ -264,8 +281,10 @@ class _TrendsTab extends ConsumerWidget {
                     ),
                   ),
                 ),
-                topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                topTitles:
+                    const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                rightTitles:
+                    const AxisTitles(sideTitles: SideTitles(showTitles: false)),
               ),
               gridData: const FlGridData(show: true),
               borderData: FlBorderData(show: false),
@@ -294,7 +313,8 @@ class _ForecastTab extends ConsumerWidget {
             const SizedBox(height: 16),
             const Text('Not enough data for forecast yet'),
             const SizedBox(height: 8),
-            Text('$e', style: const TextStyle(color: Colors.grey, fontSize: 12)),
+            Text('$e',
+                style: const TextStyle(color: Colors.grey, fontSize: 12)),
           ],
         ),
       ),
@@ -317,7 +337,9 @@ class _ForecastTab extends ConsumerWidget {
                       if (forecast.confidence != null)
                         Chip(
                           label: Text(forecast.confidence!.toUpperCase()),
-                          backgroundColor: _confidenceColor(forecast.confidence!).withOpacity(0.15),
+                          backgroundColor:
+                              _confidenceColor(forecast.confidence!)
+                                  .withValues(alpha: 0.15),
                         ),
                     ],
                   ),
@@ -330,7 +352,9 @@ class _ForecastTab extends ConsumerWidget {
                       style: Theme.of(context)
                           .textTheme
                           .headlineMedium
-                          ?.copyWith(fontWeight: FontWeight.bold, color: Colors.orange),
+                          ?.copyWith(
+                              fontWeight: FontWeight.bold,
+                              color: Colors.orange),
                     ),
                   ],
                 ],
@@ -344,7 +368,8 @@ class _ForecastTab extends ConsumerWidget {
                 child: ListTile(
                   title: Text(e.key),
                   trailing: Text(
-                    CurrencyFormatter.format((e.value as num).toDouble(), 'USD'),
+                    CurrencyFormatter.format(
+                        (e.value as num).toDouble(), 'USD'),
                     style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
                 ),
@@ -353,7 +378,24 @@ class _ForecastTab extends ConsumerWidget {
           OutlinedButton.icon(
             icon: const Icon(Icons.refresh),
             label: const Text('Refresh Forecast'),
-            onPressed: () => ref.invalidate(forecastProvider(null)),
+            onPressed: () async {
+              try {
+                final client = await ref.read(apiClientProvider.future);
+                await client.post(Endpoints.analyticsRefreshForecast);
+                ref.invalidate(forecastProvider(null));
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Forecast refreshed')),
+                  );
+                }
+              } catch (e) {
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Refresh failed: $e')),
+                  );
+                }
+              }
+            },
           ),
         ],
       ),

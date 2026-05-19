@@ -38,6 +38,11 @@ sudo docker compose exec backend alembic upgrade head
 sudo docker compose exec backend alembic revision --autogenerate -m "description"
 ```
 
+**Run backend tests:**
+```bash
+sudo docker compose exec backend pytest
+```
+
 **API docs (dev only):** `http://localhost:8000/docs`
 
 ## Architecture
@@ -50,16 +55,19 @@ Auth is a static Bearer token (`APP_API_KEY` env var) — no JWT, single-user se
 
 **Request flow:** Router → Service (`app/services/`) → ORM model. Routers never contain business logic. Services never import from routers.
 
-`transaction_service.py` is the most complex service — it calls `exchange_service.convert()` to update account balances in the account's currency and store `amount_base` in the base currency on every create/update/delete.
+**Core services:**
+- `transaction_service.py` — most complex service; calls `exchange_service.convert()` to update account balances and store `amount_base` in base currency on create/update/delete
+- `exchange_service.py` — fetches from `open.er-api.com/v6/latest/{base}`, 1-hour in-memory cache, hardcoded fallback for UZS/TJS/RUB
+- `account_service.py` — account CRUD and balance operations
+- `analytics_service.py` — aggregates spending/income data for charts
+- `statement_import_service.py` — bulk statement import. CSV/TXT parsed deterministically via `csv.Sniffer` + multilingual (EN/RU) `HEADER_ALIASES`; PDF rendered to JPEGs with `pdf2image` (needs `poppler-utils`, already in Dockerfile) then sent to Gemini; images and non-tabular text fall back to Gemini parsing. Exposed as `POST /api/v1/accounts/{id}/import-statement`; the router (`accounts.py`) deduplicates against existing rows via `_tx_signature` (date+type+amount+currency+normalized description) and queues AI categorization per imported row
 
 **AI layer (`app/ai/`):**
-- `client.py` — raw httpx calls to Gemini REST API (`gemini-1.5-flash`). No SDK. Uses `generateContent` for single calls and `streamGenerateContent?alt=sse` for chat streaming.
-- `categorizer.py` — BackgroundTask triggered after transaction POST/PUT.
-- `ocr.py` — BackgroundTask triggered after receipt upload; resizes image with Pillow before sending to Gemini vision.
-- `assistant.py` — builds a system prompt from live DB snapshot, maintains last 20 messages, streams SSE to Flutter.
-- `forecaster.py` — aggregates 6 months of SQL data, calls Haiku, caches result in `forecasts` table (TTL 24h).
-
-**Exchange rates (`app/services/exchange_service.py`):** Fetches from `open.er-api.com/v6/latest/{base}`, 1-hour in-memory cache, hardcoded fallback rates for when API is unreachable. UZS, TJS, RUB use fallback only (not in ECB dataset).
+- `client.py` — raw httpx calls to Gemini REST API (`gemini-2.5-flash`). No SDK. Uses `generateContent` for single calls and `streamGenerateContent?alt=sse` for chat streaming. `gemini_url()` raises a clear `RuntimeError` if `GEMINI_API_KEY` is unset
+- `categorizer.py` — BackgroundTask triggered after transaction POST/PUT
+- `ocr.py` — BackgroundTask triggered after receipt upload; resizes image with Pillow before sending to Gemini vision
+- `assistant.py` — builds system prompt from live DB snapshot, maintains last 20 messages, streams SSE to Flutter
+- `forecaster.py` — aggregates 6 months of SQL data, calls Gemini 2.5 Flash, caches result in `forecasts` table (TTL 24h)
 
 ### Frontend (`frontend/lib/`)
 
@@ -75,10 +83,26 @@ Flutter with Riverpod 2 (provider-per-file pattern, no codegen for providers). N
 
 **Lock screen:** `providers/lock_provider.dart` stores PIN in `shared_preferences`. `app.dart` watches `lockProvider` — when `true`, renders `LockScreen` instead of the router entirely.
 
+**Key providers:**
+- `api_client_provider.dart` — Dio wrapper with auth header
+- `transaction_provider.dart` — CRUD + categorize actions
+- `account_provider.dart` — account management
+- `category_provider.dart` — category CRUD
+- `analytics_provider.dart` — dashboard data fetching
+- `chat_provider.dart` — AI chat session management
+- `exchange_provider.dart` — currency conversion
+- `lock_provider.dart` — PIN lock state
+
 ## Key conventions
 
-- Backend responses for transaction detail use `TransactionDetail` schema (includes `comments` and `receipts`); list endpoints use `TransactionOut` (no nested data).
-- `get_transaction()` always uses `selectinload` for category, comments, and receipts to avoid lazy-load errors in async context.
-- Flutter `Transaction` model has `@Default([]) List<Receipt> receipts` — missing field in JSON silently defaults to empty list.
-- When editing backend schemas that are imported by other schemas, rebuild the Docker image.
-- `.env.example` still references `CLAUDE_API_KEY` — the actual env var used is `GEMINI_API_KEY`.
+- Backend responses for transaction detail use `TransactionDetail` schema (includes `comments` and `receipts`); list endpoints use `TransactionOut` (no nested data)
+- `get_transaction()` always uses `selectinload` for category, comments, and receipts to avoid lazy-load errors in async context
+- Flutter `Transaction` model has `@Default([]) List<Receipt> receipts` — missing field in JSON silently defaults to empty list
+- When editing backend schemas that are imported by other schemas, rebuild the Docker image
+- Python deps are declared in `backend/pyproject.toml`, but the `Dockerfile` does **not** install from it — it has its own hardcoded `uv pip install` list. Adding a dependency requires editing **both**, then `--build backend`.
+- No AI SDK is used — all AI calls (categorize, OCR, chat, forecast, statement import) go through `app/ai/client.py` via raw httpx to the Gemini REST API. Only `GEMINI_API_KEY` matters
+- `pytest`/`pytest-asyncio` are installed only in the Docker `development` stage; there is no test suite in the repo yet, so `pytest` currently collects nothing
+- `.env.example` still references `CLAUDE_API_KEY` — the actual env var used is `GEMINI_API_KEY`
+- All async database operations use `AsyncSession`; never use synchronous SQLAlchemy methods
+- Backend environment variables: `DATABASE_URL`, `GEMINI_API_KEY`, `APP_API_KEY`, `RECEIPTS_DIR`, `BASE_CURRENCY` (default: USD)
+- Frontend API configuration is user-configurable via Settings screen (stored in `shared_preferences`)

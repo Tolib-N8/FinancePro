@@ -2,13 +2,17 @@ import uuid
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, status
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import Auth, DBSession
 from app.schemas.account import AccountCreate, AccountOut, AccountUpdate
+from app.schemas.statement import StatementImportResult, StatementImportSample
+from app.schemas.transaction import TransactionCreate
 from app.schemas.transaction import PaginatedTransactions
-from app.services import account_service, transaction_service
+from app.services import account_service, statement_import_service, transaction_service
+from app.models.transaction import Transaction
 
 router = APIRouter(dependencies=[Auth])
 
@@ -69,3 +73,121 @@ async def recalculate_balance(account_id: uuid.UUID, db: AsyncSession = DBSessio
         raise HTTPException(status_code=404, detail="Account not found")
     balance = await account_service.recalculate_balance(db, account_id)
     return {"balance": balance}
+
+
+@router.post("/{account_id}/import-statement", response_model=StatementImportResult)
+async def import_statement(
+    account_id: uuid.UUID,
+    file: UploadFile,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = DBSession,
+):
+    account = await account_service.get_account(db, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    if not statement_import_service.is_supported_statement_file(file.filename, file.content_type):
+        raise HTTPException(status_code=400, detail="Unsupported statement format")
+
+    try:
+        entries = await statement_import_service.parse_statement_entries(
+            await file.read(),
+            file.filename,
+            file.content_type,
+            account.currency,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    dates = [entry.date for entry in entries]
+    existing_result = await db.execute(
+        select(Transaction).where(
+            and_(
+                Transaction.account_id == account_id,
+                Transaction.date >= min(dates),
+                Transaction.date <= max(dates),
+            )
+        )
+    )
+
+    existing_signatures = {
+        _tx_signature(tx.date, tx.type, float(tx.amount), tx.currency, tx.description)
+        for tx in existing_result.scalars().all()
+    }
+
+    imported: list[StatementImportSample] = []
+    skipped_duplicates = 0
+
+    for entry in entries:
+        signature = _tx_signature(
+            entry.date,
+            entry.tx_type,
+            entry.amount,
+            entry.currency,
+            entry.description,
+        )
+        if signature in existing_signatures:
+            skipped_duplicates += 1
+            continue
+
+        tx = await transaction_service.create_transaction(
+            db,
+            TransactionCreate(
+                account_id=account_id,
+                type=entry.tx_type,
+                amount=entry.amount,
+                currency=entry.currency,
+                date=entry.date,
+                description=entry.description,
+                category_id=None,
+                is_recurring=False,
+            ),
+        )
+        existing_signatures.add(signature)
+        imported.append(
+            StatementImportSample(
+                date=entry.date,
+                type=entry.tx_type,
+                amount=entry.amount,
+                currency=entry.currency,
+                description=entry.description,
+            )
+        )
+        if entry.description:
+            background_tasks.add_task(
+                _categorize_transaction,
+                tx.id,
+                entry.description,
+                entry.amount,
+            )
+
+    return StatementImportResult(
+        account_id=account_id,
+        parsed_count=len(entries),
+        imported_count=len(imported),
+        skipped_duplicates=skipped_duplicates,
+        sample=imported[:10],
+    )
+
+
+def _tx_signature(
+    tx_date: date,
+    tx_type: str,
+    amount: float,
+    currency: str,
+    description: str | None,
+) -> tuple[str, str, str, str, str]:
+    normalized_description = " ".join((description or "").strip().lower().split())
+    return (
+        tx_date.isoformat(),
+        tx_type,
+        f"{amount:.2f}",
+        currency.upper(),
+        normalized_description,
+    )
+
+
+async def _categorize_transaction(tx_id: uuid.UUID, description: str, amount: float) -> None:
+    from app.ai.categorizer import categorize_and_save
+
+    await categorize_and_save(tx_id, description, amount)

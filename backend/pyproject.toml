@@ -17,8 +17,7 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
 
-    # AI
-    "google-generativeai>=0.8",
+    # AI: Gemini REST is called via raw httpx (no SDK) — see app/ai/client.py
 
     # File handling
     "python-multipart>=0.0.9",
@@ -39,6 +38,10 @@ dev = [
     "httpx>=0.27",
     "watchfiles>=0.21",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [build-system]
 requires = ["setuptools>=68"]

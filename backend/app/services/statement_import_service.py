@@ -1,0 +1,471 @@
+import base64
+import csv
+import io
+import json
+import re
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+
+from dateutil import parser as date_parser
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from app.ai.client import generate
+
+SUPPORTED_EXTENSIONS = {".csv", ".txt", ".pdf", ".jpg", ".jpeg", ".png", ".webp"}
+TABULAR_MIME = {
+    "text/csv",
+    "application/csv",
+    "text/plain",
+    "application/vnd.ms-excel",
+}
+IMAGE_MIME = {"image/jpeg", "image/png", "image/webp"}
+PDF_MIME = {"application/pdf"}
+
+HEADER_ALIASES = {
+    "date": {
+        "date",
+        "bookingdate",
+        "transactiondate",
+        "operationdate",
+        "valuedate",
+        "дата",
+        "датаоперации",
+        "дататранзакции",
+        "датаплатежа",
+    },
+    "description": {
+        "description",
+        "details",
+        "purpose",
+        "merchant",
+        "counterparty",
+        "payee",
+        "memo",
+        "note",
+        "comment",
+        "назначение",
+        "описание",
+        "контрагент",
+        "получатель",
+        "операция",
+        "магазин",
+    },
+    "amount": {
+        "amount",
+        "sum",
+        "value",
+        "сумма",
+        "итого",
+    },
+    "debit": {
+        "debit",
+        "withdrawal",
+        "outflow",
+        "expense",
+        "списание",
+        "расход",
+        "дебет",
+    },
+    "credit": {
+        "credit",
+        "deposit",
+        "inflow",
+        "income",
+        "поступление",
+        "приход",
+        "кредит",
+    },
+    "currency": {
+        "currency",
+        "curr",
+        "валюта",
+    },
+}
+
+STATEMENT_PROMPT = """You are a bank statement parser.
+Extract ONLY real transaction rows from the provided bank statement.
+
+Return ONLY valid JSON in this exact shape:
+{{
+  "transactions": [
+    {{
+      "date": "YYYY-MM-DD",
+      "description": "short transaction description",
+      "amount": 123.45,
+      "currency": "USD",
+      "direction": "debit"
+    }}
+  ]
+}}
+
+Rules:
+- Include only transaction rows. Skip opening balance, closing balance, totals, fees summary, headers, and page footers.
+- "direction" means: debit = money out, credit = money in.
+- "amount" must always be a positive number.
+- If currency is missing, use "{account_currency}".
+- If a row is unreadable or incomplete, skip it.
+- Do not invent transactions.
+- Return JSON only, with no markdown.
+"""
+
+
+@dataclass(slots=True)
+class ParsedStatementEntry:
+    date: date
+    amount: float
+    tx_type: str
+    description: str
+    currency: str
+
+
+def is_supported_statement_file(filename: str | None, content_type: str | None) -> bool:
+    ext = Path(filename or "").suffix.lower()
+    content_type = (content_type or "").lower()
+    return ext in SUPPORTED_EXTENSIONS or content_type in TABULAR_MIME | IMAGE_MIME | PDF_MIME
+
+
+async def parse_statement_entries(
+    file_bytes: bytes,
+    filename: str | None,
+    content_type: str | None,
+    account_currency: str,
+) -> list[ParsedStatementEntry]:
+    if not file_bytes:
+        raise ValueError("Empty statement file")
+
+    ext = Path(filename or "").suffix.lower()
+    content_type = (content_type or "").lower()
+
+    if ext in {".csv", ".txt"} or content_type in TABULAR_MIME:
+        entries = await _parse_tabular_statement(file_bytes, account_currency)
+    elif ext == ".pdf" or content_type in PDF_MIME:
+        entries = await _parse_binary_statement_with_ai(file_bytes, "pdf", account_currency)
+    elif ext in {".jpg", ".jpeg", ".png", ".webp"} or content_type in IMAGE_MIME:
+        entries = await _parse_binary_statement_with_ai(file_bytes, "image", account_currency)
+    else:
+        raise ValueError("Unsupported statement format")
+
+    if not entries:
+        raise ValueError("No transactions found in statement")
+    return entries
+
+
+async def _parse_tabular_statement(file_bytes: bytes, account_currency: str) -> list[ParsedStatementEntry]:
+    text = _decode_text(file_bytes)
+    sample = text[:4096]
+
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    except csv.Error:
+        reader = csv.DictReader(io.StringIO(text), delimiter=";")
+    fieldnames = [field or "" for field in reader.fieldnames or []]
+    if not fieldnames:
+        raise ValueError("Statement file must contain a header row")
+
+    date_key = _find_header(fieldnames, "date")
+    description_key = _find_header(fieldnames, "description")
+    amount_key = _find_header(fieldnames, "amount")
+    debit_key = _find_header(fieldnames, "debit")
+    credit_key = _find_header(fieldnames, "credit")
+    currency_key = _find_header(fieldnames, "currency")
+
+    if not date_key or not (amount_key or debit_key or credit_key):
+        return await _parse_text_statement_with_ai(text, account_currency)
+
+    entries: list[ParsedStatementEntry] = []
+    for row in reader:
+        entry_date = _parse_date(row.get(date_key))
+        if not entry_date:
+            continue
+
+        amount_data = _resolve_amount(row, amount_key, debit_key, credit_key)
+        if not amount_data:
+            continue
+        amount, tx_type = amount_data
+
+        description = _pick_description(row, description_key)
+        currency = _normalize_currency(row.get(currency_key), account_currency)
+
+        entries.append(
+            ParsedStatementEntry(
+                date=entry_date,
+                amount=amount,
+                tx_type=tx_type,
+                description=description,
+                currency=currency,
+            )
+        )
+
+    return entries
+
+
+async def _parse_text_statement_with_ai(text: str, account_currency: str) -> list[ParsedStatementEntry]:
+    parts = [
+        {"text": STATEMENT_PROMPT.format(account_currency=account_currency)},
+        {"text": text[:40000]},
+    ]
+    data = await _call_statement_ai(parts)
+    return _entries_from_ai_payload(data, account_currency)
+
+
+async def _parse_binary_statement_with_ai(
+    file_bytes: bytes,
+    file_kind: str,
+    account_currency: str,
+) -> list[ParsedStatementEntry]:
+    if file_kind == "pdf":
+        image_bytes = _pdf_to_jpegs(file_bytes, max_pages=8)
+    else:
+        image_bytes = [_to_jpeg(file_bytes)]
+
+    parts = []
+    for image in image_bytes:
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": base64.standard_b64encode(image).decode(),
+                }
+            }
+        )
+    parts.append({"text": STATEMENT_PROMPT.format(account_currency=account_currency)})
+
+    data = await _call_statement_ai(parts)
+    return _entries_from_ai_payload(data, account_currency)
+
+
+def _decode_text(file_bytes: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp1251", "latin-1"):
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return file_bytes.decode("utf-8", errors="ignore")
+
+
+def _normalize_header(text: str) -> str:
+    return re.sub(r"[^a-zа-я0-9]+", "", text.lower())
+
+
+def _find_header(fieldnames: list[str], kind: str) -> str | None:
+    aliases = HEADER_ALIASES[kind]
+    normalized = {_normalize_header(name): name for name in fieldnames}
+
+    for alias in aliases:
+        if alias in normalized:
+            return normalized[alias]
+
+    for key, original in normalized.items():
+        if any(alias in key or key in alias for alias in aliases):
+            return original
+    return None
+
+
+def _parse_date(value: object) -> date | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return date_parser.parse(text, dayfirst=True, fuzzy=True).date()
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _parse_amount(value: object) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    negative = False
+    if text.startswith("(") and text.endswith(")"):
+        negative = True
+        text = text[1:-1]
+
+    text = (
+        text.replace("\u00a0", "")
+        .replace(" ", "")
+        .replace("−", "-")
+        .replace("–", "-")
+    )
+    text = re.sub(r"[^0-9,.\-]", "", text)
+    if not text:
+        return None
+
+    if text.endswith("-"):
+        negative = True
+        text = text[:-1]
+
+    if text.count(",") and text.count("."):
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif text.count(",") and not text.count("."):
+        text = text.replace(",", ".")
+
+    try:
+        amount = float(text)
+    except ValueError:
+        return None
+
+    if negative and amount > 0:
+        amount *= -1
+    return amount
+
+
+def _looks_numeric_value(value: str) -> bool:
+    cleaned = (
+        value.strip()
+        .replace("\u00a0", "")
+        .replace(" ", "")
+        .replace("−", "-")
+        .replace("–", "-")
+    )
+    cleaned = re.sub(r"[A-Za-zА-Яа-я$€£¥₽₸₴₾₼₮₱₹]", "", cleaned)
+    cleaned = re.sub(r"[^0-9,.\-()]", "", cleaned)
+    return bool(cleaned) and _parse_amount(cleaned) is not None
+
+
+def _resolve_amount(
+    row: dict[str, object],
+    amount_key: str | None,
+    debit_key: str | None,
+    credit_key: str | None,
+) -> tuple[float, str] | None:
+    if amount_key:
+        amount = _parse_amount(row.get(amount_key))
+        if amount is None or amount == 0:
+            return None
+        if amount < 0:
+            return abs(amount), "expense"
+        return amount, "income"
+
+    debit = _parse_amount(row.get(debit_key)) if debit_key else None
+    credit = _parse_amount(row.get(credit_key)) if credit_key else None
+
+    if debit and abs(debit) > 0:
+        return abs(debit), "expense"
+    if credit and abs(credit) > 0:
+        return abs(credit), "income"
+    return None
+
+
+def _pick_description(row: dict[str, object], description_key: str | None) -> str:
+    if description_key:
+        text = str(row.get(description_key) or "").strip()
+        if text:
+            return text[:255]
+
+    for key, value in row.items():
+        normalized_key = _normalize_header(key)
+        if normalized_key in HEADER_ALIASES["date"] | HEADER_ALIASES["amount"] | HEADER_ALIASES["debit"] | HEADER_ALIASES["credit"] | HEADER_ALIASES["currency"]:
+            continue
+        text = str(value or "").strip()
+        if text and not _looks_numeric_value(text):
+            return text[:255]
+
+    return "Imported from statement"
+
+
+def _normalize_currency(value: object, fallback: str) -> str:
+    text = re.sub(r"[^A-Za-z]", "", str(value or "")).upper()
+    if len(text) == 3:
+        return text
+    return fallback.upper()
+
+
+def _to_jpeg(image_bytes: bytes, max_px: int = 1568) -> bytes:
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(image_bytes))
+    width, height = image.size
+    if max(width, height) > max_px:
+        ratio = max_px / max(width, height)
+        image = image.resize((int(width * ratio), int(height * ratio)), Image.LANCZOS)
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=85)
+    return out.getvalue()
+
+
+def _pdf_to_jpegs(pdf_bytes: bytes, max_pages: int = 8) -> list[bytes]:
+    from pdf2image import convert_from_bytes
+
+    pages = convert_from_bytes(pdf_bytes, dpi=140, first_page=1, last_page=max_pages)
+    output: list[bytes] = []
+    for page in pages:
+        out = io.BytesIO()
+        if page.mode != "RGB":
+            page = page.convert("RGB")
+        page.save(out, format="JPEG", quality=85)
+        output.append(out.getvalue())
+    return output
+
+
+def _parse_json(text: str) -> dict:
+    cleaned = text.strip()
+    # Remove markdown code blocks
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        for part in parts:
+            if part.strip().startswith("json"):
+                cleaned = part[4:]
+                break
+            elif "{" in part:
+                cleaned = part
+                break
+    # Find JSON object boundaries
+    start = cleaned.find("{")
+    end = cleaned.rfind("}") + 1
+    if start >= 0 and end > start:
+        cleaned = cleaned[start:end]
+    return json.loads(cleaned.strip())
+
+
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=8))
+async def _call_statement_ai(parts: list[dict]) -> dict:
+    text = await generate(parts, max_tokens=8192, temperature=0)
+    return _parse_json(text)
+
+
+def _entries_from_ai_payload(payload: dict, account_currency: str) -> list[ParsedStatementEntry]:
+    raw_items = payload.get("transactions", [])
+    entries: list[ParsedStatementEntry] = []
+
+    for item in raw_items:
+        entry_date = _parse_date(item.get("date"))
+        amount = _parse_amount(item.get("amount"))
+        if not entry_date or amount is None or amount == 0:
+            continue
+
+        direction = str(item.get("direction") or item.get("type") or "").strip().lower()
+        if not direction:
+            direction = "expense" if amount < 0 else "income"
+
+        if direction in {"debit", "expense", "out", "withdrawal"}:
+            tx_type = "expense"
+        else:
+            tx_type = "income"
+
+        description = str(item.get("description") or "").strip()[:255] or "Imported from statement"
+        currency = _normalize_currency(item.get("currency"), account_currency)
+
+        entries.append(
+            ParsedStatementEntry(
+                date=entry_date,
+                amount=abs(amount),
+                tx_type=tx_type,
+                description=description,
+                currency=currency,
+            )
+        )
+
+    return entries
