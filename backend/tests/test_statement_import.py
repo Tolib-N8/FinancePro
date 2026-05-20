@@ -120,6 +120,41 @@ async def test_parse_tabular_statement_semicolon_russian_debit_credit():
     assert entries[1].amount == 50000.0
 
 
+# ---- _parse_json (LLM response cleanup) ----------------------------------
+
+def test_parse_json_plain_object():
+    assert sis._parse_json('{"transactions": []}') == {"transactions": []}
+
+
+def test_parse_json_strips_markdown_fence():
+    text = '```json\n{"transactions": [{"amount": 1}]}\n```'
+    assert sis._parse_json(text) == {"transactions": [{"amount": 1}]}
+
+
+def test_parse_json_tolerates_trailing_extra_data():
+    # Regression: Gemini sometimes appends chatter after the JSON object,
+    # which made bare json.loads raise "Extra data". raw_decode must accept it.
+    text = '{"transactions": [{"amount": 1}]}\n\nNotes: this is unstructured trailing text.'
+    assert sis._parse_json(text) == {"transactions": [{"amount": 1}]}
+
+
+def test_parse_json_accepts_bare_array():
+    # If Gemini returns just the array (forgetting the wrapper object),
+    # the parser should still recover by treating it as the transactions list.
+    text = '[{"amount": 1}, {"amount": 2}]'
+    assert sis._parse_json(text) == {"transactions": [{"amount": 1}, {"amount": 2}]}
+
+
+def test_parse_json_no_json_raises():
+    import json as _json
+    try:
+        sis._parse_json("just some prose with no braces")
+    except _json.JSONDecodeError:
+        pass
+    else:
+        raise AssertionError("expected JSONDecodeError")
+
+
 # ---- _tx_signature (router dedup key) ------------------------------------
 
 def test_tx_signature_normalizes_case_whitespace_amount():

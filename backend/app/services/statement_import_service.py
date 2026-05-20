@@ -10,7 +10,7 @@ from pathlib import Path
 
 import httpx
 from dateutil import parser as date_parser
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import RetryError, retry, stop_after_attempt, wait_exponential
 
 from app.ai.client import generate
 
@@ -155,7 +155,7 @@ async def parse_statement_entries(
     except RuntimeError as exc:
         # gemini_url() raises this when GEMINI_API_KEY is unset — surface to the user.
         raise ValueError(str(exc)) from exc
-    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+    except (httpx.HTTPError, json.JSONDecodeError, RetryError) as exc:
         logger.exception("Statement AI parse failed")
         raise ValueError(
             "Could not read this statement automatically — try exporting as CSV "
@@ -405,9 +405,13 @@ def _normalize_currency(value: object, fallback: str) -> str:
 
 
 def _to_jpeg(image_bytes: bytes, max_px: int = 1568) -> bytes:
-    from PIL import Image
+    from PIL import Image, UnidentifiedImageError
 
-    image = Image.open(io.BytesIO(image_bytes))
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        image.load()
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("File is not a valid image") from exc
     width, height = image.size
     if max(width, height) > max_px:
         ratio = max_px / max(width, height)
@@ -422,8 +426,13 @@ def _to_jpeg(image_bytes: bytes, max_px: int = 1568) -> bytes:
 
 def _pdf_to_jpegs(pdf_bytes: bytes, max_pages: int = 8) -> list[bytes]:
     from pdf2image import convert_from_bytes
+    from pdf2image.exceptions import PDFPageCountError, PDFSyntaxError
 
-    pages = convert_from_bytes(pdf_bytes, dpi=140, first_page=1, last_page=max_pages)
+    try:
+        pages = convert_from_bytes(pdf_bytes, dpi=140, first_page=1, last_page=max_pages)
+    except (PDFPageCountError, PDFSyntaxError) as exc:
+        raise ValueError("File is not a valid PDF") from exc
+
     output: list[bytes] = []
     for page in pages:
         out = io.BytesIO()
@@ -435,28 +444,47 @@ def _pdf_to_jpegs(pdf_bytes: bytes, max_pages: int = 8) -> list[bytes]:
 
 
 def _parse_json(text: str) -> dict:
+    """Extract the first JSON object/array from an LLM response.
+
+    Gemini sometimes returns the JSON wrapped in ```json fences, prefixed with
+    chatter, or followed by trailing tokens. We strip code fences and use
+    raw_decode so trailing characters don't break parsing.
+    """
     cleaned = text.strip()
-    # Remove markdown code blocks
     if "```" in cleaned:
-        parts = cleaned.split("```")
-        for part in parts:
-            if part.strip().startswith("json"):
-                cleaned = part[4:]
+        # Pull the first fenced block that looks like JSON.
+        for part in cleaned.split("```"):
+            stripped = part.strip()
+            if stripped.startswith("json"):
+                cleaned = stripped[4:].lstrip()
                 break
-            elif "{" in part:
-                cleaned = part
+            if stripped.startswith("{") or stripped.startswith("["):
+                cleaned = stripped
                 break
-    # Find JSON object boundaries
-    start = cleaned.find("{")
-    end = cleaned.rfind("}") + 1
-    if start >= 0 and end > start:
-        cleaned = cleaned[start:end]
-    return json.loads(cleaned.strip())
+
+    decoder = json.JSONDecoder()
+    start = min(
+        (i for i in (cleaned.find("{"), cleaned.find("[")) if i >= 0),
+        default=-1,
+    )
+    if start < 0:
+        raise json.JSONDecodeError("No JSON object found in response", cleaned, 0)
+    obj, _ = decoder.raw_decode(cleaned[start:])
+    if isinstance(obj, list):
+        return {"transactions": obj}
+    if not isinstance(obj, dict):
+        raise json.JSONDecodeError("Expected JSON object", cleaned, 0)
+    return obj
 
 
-@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=8))
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=8), reraise=False)
 async def _call_statement_ai(parts: list[dict]) -> dict:
-    text = await generate(parts, max_tokens=8192, temperature=0)
+    text = await generate(
+        parts,
+        max_tokens=8192,
+        temperature=0,
+        response_mime_type="application/json",
+    )
     return _parse_json(text)
 
 

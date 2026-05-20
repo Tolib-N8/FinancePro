@@ -15,24 +15,36 @@ def gemini_url(model: str, action: str) -> str:
     return f"{GEMINI_BASE}/{model}:{action}?key={settings.gemini_api_key}"
 
 
-async def generate(prompt: str | list, model: str = FLASH, max_tokens: int = 512, temperature: float = 0) -> str:
+async def generate(
+    prompt: str | list,
+    model: str = FLASH,
+    max_tokens: int = 512,
+    temperature: float = 0,
+    *,
+    response_mime_type: str | None = None,
+) -> str:
     """Simple text (or multimodal) generation. Returns response text.
     Thinking is disabled for deterministic JSON/text extraction tasks.
+    Pass response_mime_type="application/json" to force valid JSON output.
     """
     if isinstance(prompt, str):
         contents = [{"parts": [{"text": prompt}]}]
     else:
         contents = [{"parts": prompt}]
 
+    generation_config: dict = {
+        "maxOutputTokens": max_tokens,
+        "temperature": temperature,
+        "thinkingConfig": {"thinkingBudget": 0},
+    }
+    if response_mime_type:
+        generation_config["responseMimeType"] = response_mime_type
+
     body = {
         "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-            "temperature": temperature,
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
+        "generationConfig": generation_config,
     }
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(gemini_url(model, "generateContent"), json=body)
         r.raise_for_status()
         data = r.json()
