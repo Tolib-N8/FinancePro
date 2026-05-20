@@ -51,6 +51,29 @@ def test_find_header_russian():
     assert sis._find_header(fields, "amount") == "Сумма"
 
 
+# ---- _parse_date ---------------------------------------------------------
+
+def test_parse_date_iso_format_not_misread_as_dayfirst():
+    # Regression: dateutil with dayfirst=True flips "2026-05-01" to "2026-01-05".
+    # The ISO branch must keep year-first ordering.
+    assert sis._parse_date("2026-05-01") == date(2026, 5, 1)
+    assert sis._parse_date("2024-03-07") == date(2024, 3, 7)
+    assert sis._parse_date("2024/03/07") == date(2024, 3, 7)
+    assert sis._parse_date("2024.03.07") == date(2024, 3, 7)
+
+
+def test_parse_date_european_dayfirst_preserved():
+    assert sis._parse_date("01/05/2026") == date(2026, 5, 1)
+    assert sis._parse_date("15.01.2024") == date(2024, 1, 15)
+    assert sis._parse_date("01-05-2026") == date(2026, 5, 1)
+
+
+def test_parse_date_invalid_returns_none():
+    assert sis._parse_date("") is None
+    assert sis._parse_date(None) is None
+    assert sis._parse_date("not a date") is None
+
+
 # ---- _resolve_amount -----------------------------------------------------
 
 def test_resolve_amount_signed_single_column():

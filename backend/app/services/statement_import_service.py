@@ -2,15 +2,19 @@ import base64
 import csv
 import io
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+import httpx
 from dateutil import parser as date_parser
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.ai.client import generate
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = {".csv", ".txt", ".pdf", ".jpg", ".jpeg", ".png", ".webp"}
 TABULAR_MIME = {
@@ -137,14 +141,26 @@ async def parse_statement_entries(
     ext = Path(filename or "").suffix.lower()
     content_type = (content_type or "").lower()
 
-    if ext in {".csv", ".txt"} or content_type in TABULAR_MIME:
-        entries = await _parse_tabular_statement(file_bytes, account_currency)
-    elif ext == ".pdf" or content_type in PDF_MIME:
-        entries = await _parse_binary_statement_with_ai(file_bytes, "pdf", account_currency)
-    elif ext in {".jpg", ".jpeg", ".png", ".webp"} or content_type in IMAGE_MIME:
-        entries = await _parse_binary_statement_with_ai(file_bytes, "image", account_currency)
-    else:
-        raise ValueError("Unsupported statement format")
+    try:
+        if ext in {".csv", ".txt"} or content_type in TABULAR_MIME:
+            entries = await _parse_tabular_statement(file_bytes, account_currency)
+        elif ext == ".pdf" or content_type in PDF_MIME:
+            entries = await _parse_binary_statement_with_ai(file_bytes, "pdf", account_currency)
+        elif ext in {".jpg", ".jpeg", ".png", ".webp"} or content_type in IMAGE_MIME:
+            entries = await _parse_binary_statement_with_ai(file_bytes, "image", account_currency)
+        else:
+            raise ValueError("Unsupported statement format")
+    except ValueError:
+        raise
+    except RuntimeError as exc:
+        # gemini_url() raises this when GEMINI_API_KEY is unset — surface to the user.
+        raise ValueError(str(exc)) from exc
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        logger.exception("Statement AI parse failed")
+        raise ValueError(
+            "Could not read this statement automatically — try exporting as CSV "
+            "with a header row (Date, Description, Amount, Currency)."
+        ) from exc
 
     if not entries:
         raise ValueError("No transactions found in statement")
@@ -263,14 +279,22 @@ def _find_header(fieldnames: list[str], kind: str) -> str | None:
     return None
 
 
+_ISO_DATE_RE = re.compile(r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T\s].*)?$")
+
+
 def _parse_date(value: object) -> date | None:
     if value is None:
         return None
     text = str(value).strip()
     if not text:
         return None
+    # ISO-style "YYYY-MM-DD" (or YYYY/MM/DD, YYYY.MM.DD) is unambiguous — parse
+    # year-first so dateutil doesn't flip month/day when both are <= 12.
+    # Everything else (e.g. "01/05/2026", "15.01.2024") is treated as day-first
+    # which matches European / Russian bank statements.
+    dayfirst = not bool(_ISO_DATE_RE.match(text))
     try:
-        return date_parser.parse(text, dayfirst=True, fuzzy=True).date()
+        return date_parser.parse(text, dayfirst=dayfirst, fuzzy=True).date()
     except (ValueError, TypeError, OverflowError):
         return None
 
