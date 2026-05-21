@@ -16,9 +16,14 @@ class ApiClient {
       connectTimeout: const Duration(seconds: 10),
       receiveTimeout: const Duration(minutes: 2),
       sendTimeout: const Duration(minutes: 2),
+      // Default JSON for normal requests. Do NOT pin Content-Type in the
+      // shared headers map — that overrides Dio's automatic
+      // multipart/form-data + boundary detection for FormData uploads
+      // (statement / receipt import), which makes the server unable to
+      // parse the body and the request hangs.
+      contentType: Headers.jsonContentType,
       headers: {
         'Authorization': 'Bearer $apiKey',
-        'Content-Type': 'application/json',
       },
     ));
 
