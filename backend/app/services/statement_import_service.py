@@ -17,11 +17,14 @@ from app.ai.client import generate
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_EXTENSIONS = {".csv", ".txt", ".pdf", ".jpg", ".jpeg", ".png", ".webp"}
+SUPPORTED_EXTENSIONS = {".csv", ".txt", ".xlsx", ".pdf", ".jpg", ".jpeg", ".png", ".webp"}
 TABULAR_MIME = {
     "text/csv",
     "application/csv",
     "text/plain",
+}
+SPREADSHEET_MIME = {
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.ms-excel",
 }
 IMAGE_MIME = {"image/jpeg", "image/png", "image/webp"}
@@ -127,7 +130,8 @@ class ParsedStatementEntry:
 def is_supported_statement_file(filename: str | None, content_type: str | None) -> bool:
     ext = Path(filename or "").suffix.lower()
     content_type = (content_type or "").lower()
-    return ext in SUPPORTED_EXTENSIONS or content_type in TABULAR_MIME | IMAGE_MIME | PDF_MIME
+    known_mime = TABULAR_MIME | SPREADSHEET_MIME | IMAGE_MIME | PDF_MIME
+    return ext in SUPPORTED_EXTENSIONS or content_type in known_mime
 
 
 async def parse_statement_entries(
@@ -143,7 +147,9 @@ async def parse_statement_entries(
     content_type = (content_type or "").lower()
 
     try:
-        if ext in {".csv", ".txt"} or content_type in TABULAR_MIME:
+        if ext == ".xlsx" or content_type in SPREADSHEET_MIME:
+            entries = _parse_xlsx_statement(file_bytes, account_currency)
+        elif ext in {".csv", ".txt"} or content_type in TABULAR_MIME:
             entries = await _parse_tabular_statement(file_bytes, account_currency)
         elif ext == ".pdf" or content_type in PDF_MIME:
             # Prefer the PDF's embedded text layer — a deterministic parse uses
@@ -175,6 +181,46 @@ async def parse_statement_entries(
     return entries
 
 
+def _rows_to_entries(
+    fieldnames: list[str],
+    rows: list[dict[str, object]],
+    account_currency: str,
+) -> list[ParsedStatementEntry] | None:
+    """Turn header-keyed rows into entries. Returns None if the columns don't
+    identify a date plus an amount/debit/credit — the caller then falls back."""
+    date_key = _find_header(fieldnames, "date")
+    description_key = _find_header(fieldnames, "description")
+    amount_key = _find_header(fieldnames, "amount")
+    debit_key = _find_header(fieldnames, "debit")
+    credit_key = _find_header(fieldnames, "credit")
+    currency_key = _find_header(fieldnames, "currency")
+
+    if not date_key or not (amount_key or debit_key or credit_key):
+        return None
+
+    entries: list[ParsedStatementEntry] = []
+    for row in rows:
+        entry_date = _parse_date(row.get(date_key))
+        if not entry_date:
+            continue
+
+        amount_data = _resolve_amount(row, amount_key, debit_key, credit_key)
+        if not amount_data:
+            continue
+        amount, tx_type = amount_data
+
+        entries.append(
+            ParsedStatementEntry(
+                date=entry_date,
+                amount=amount,
+                tx_type=tx_type,
+                description=_pick_description(row, description_key),
+                currency=_normalize_currency(row.get(currency_key), account_currency),
+            )
+        )
+    return entries
+
+
 async def _parse_tabular_statement(file_bytes: bytes, account_currency: str) -> list[ParsedStatementEntry]:
     text = _decode_text(file_bytes)
     sample = text[:4096]
@@ -188,41 +234,57 @@ async def _parse_tabular_statement(file_bytes: bytes, account_currency: str) -> 
     if not fieldnames:
         raise ValueError("Statement file must contain a header row")
 
-    date_key = _find_header(fieldnames, "date")
-    description_key = _find_header(fieldnames, "description")
-    amount_key = _find_header(fieldnames, "amount")
-    debit_key = _find_header(fieldnames, "debit")
-    credit_key = _find_header(fieldnames, "credit")
-    currency_key = _find_header(fieldnames, "currency")
-
-    if not date_key or not (amount_key or debit_key or credit_key):
+    entries = _rows_to_entries(fieldnames, list(reader), account_currency)
+    if entries is None:
+        # Headers unrecognised — let the AI take a pass at the raw text.
         return await _parse_text_statement_with_ai(text, account_currency)
+    return entries
 
-    entries: list[ParsedStatementEntry] = []
-    for row in reader:
-        entry_date = _parse_date(row.get(date_key))
-        if not entry_date:
-            continue
 
-        amount_data = _resolve_amount(row, amount_key, debit_key, credit_key)
-        if not amount_data:
-            continue
-        amount, tx_type = amount_data
+def _parse_xlsx_statement(file_bytes: bytes, account_currency: str) -> list[ParsedStatementEntry]:
+    """Parse an .xlsx bank statement. Bank exports often put metadata rows
+    above the table, so the header row is detected rather than assumed."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:  # pragma: no cover - dependency must be installed
+        raise ValueError("XLSX support is not available on the server") from exc
 
-        description = _pick_description(row, description_key)
-        currency = _normalize_currency(row.get(currency_key), account_currency)
+    try:
+        workbook = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    except Exception as exc:
+        raise ValueError("File is not a valid XLSX spreadsheet") from exc
 
-        entries.append(
-            ParsedStatementEntry(
-                date=entry_date,
-                amount=amount,
-                tx_type=tx_type,
-                description=description,
-                currency=currency,
-            )
+    grid = [
+        ["" if cell is None else cell for cell in row]
+        for row in workbook.active.iter_rows(values_only=True)
+    ]
+    workbook.close()
+
+    # The header row is the first one that names a date column and an
+    # amount/debit/credit column.
+    header_idx: int | None = None
+    for idx, row in enumerate(grid[:40]):
+        names = [str(c) for c in row]
+        if _find_header(names, "date") and (
+            _find_header(names, "amount")
+            or _find_header(names, "debit")
+            or _find_header(names, "credit")
+        ):
+            header_idx = idx
+            break
+    if header_idx is None:
+        raise ValueError(
+            "Could not find a header row in the spreadsheet — expected columns "
+            "like Date, Description, Amount, Currency."
         )
 
-    return entries
+    fieldnames = [str(c).strip() for c in grid[header_idx]]
+    rows = [
+        {fieldnames[i]: cell for i, cell in enumerate(row) if i < len(fieldnames)}
+        for row in grid[header_idx + 1:]
+    ]
+    entries = _rows_to_entries(fieldnames, rows, account_currency)
+    return entries or []
 
 
 async def _parse_text_statement_with_ai(text: str, account_currency: str) -> list[ParsedStatementEntry]:

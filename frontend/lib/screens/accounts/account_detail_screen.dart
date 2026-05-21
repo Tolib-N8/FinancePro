@@ -137,7 +137,7 @@ class _AccountDetailScreenState extends ConsumerState<AccountDetailScreen> {
   Future<void> _importStatement() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['csv', 'txt', 'pdf', 'jpg', 'jpeg', 'png', 'webp'],
+      allowedExtensions: ['csv', 'txt', 'xlsx', 'pdf', 'jpg', 'jpeg', 'png', 'webp'],
     );
     if (result == null || result.files.isEmpty) return;
 
@@ -189,7 +189,7 @@ class _AccountDetailScreenState extends ConsumerState<AccountDetailScreen> {
               Text('Skipped duplicates: $duplicates'),
               const SizedBox(height: 12),
               const Text(
-                'Supported formats: CSV, TXT, PDF, JPG, PNG, WEBP',
+                'Supported formats: CSV, TXT, XLSX, PDF, JPG, PNG, WEBP',
                 style: TextStyle(fontSize: 12, color: Colors.grey),
               ),
             ],

@@ -155,6 +155,61 @@ def test_parse_json_no_json_raises():
         raise AssertionError("expected JSONDecodeError")
 
 
+# ---- _parse_xlsx_statement -----------------------------------------------
+
+def _make_xlsx(rows: list[list]) -> bytes:
+    import io as _io
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    for row in rows:
+        ws.append(row)
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_parse_xlsx_statement_with_metadata_rows():
+    # Bank exports often put title/period rows above the real header.
+    xlsx = _make_xlsx([
+        ["Account statement"],
+        ["Period: Jan 2026"],
+        ["Date", "Description", "Amount", "Currency"],
+        [date(2026, 5, 1), "Coffee", -4.50, "USD"],
+        [date(2026, 5, 2), "Salary", 2000, "USD"],
+    ])
+    entries = sis._parse_xlsx_statement(xlsx, "USD")
+    assert len(entries) == 2
+    assert entries[0].date == date(2026, 5, 1)
+    assert entries[0].tx_type == "expense"
+    assert entries[0].amount == 4.5
+    assert entries[1].tx_type == "income"
+    assert entries[1].amount == 2000.0
+
+
+def test_parse_xlsx_statement_debit_credit_columns():
+    xlsx = _make_xlsx([
+        ["Дата", "Назначение", "Списание", "Поступление", "Валюта"],
+        [date(2026, 1, 15), "Магазин", 1234.56, None, "RUB"],
+        [date(2026, 1, 16), "Зарплата", None, 50000, "RUB"],
+    ])
+    entries = sis._parse_xlsx_statement(xlsx, "RUB")
+    assert len(entries) == 2
+    assert entries[0].tx_type == "expense"
+    assert entries[0].amount == 1234.56
+    assert entries[1].tx_type == "income"
+    assert entries[1].amount == 50000.0
+
+
+def test_parse_xlsx_statement_invalid_file():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        sis._parse_xlsx_statement(b"this is not a spreadsheet", "USD")
+
+
 # ---- _parse_alif_text (deterministic PDF text-layer parsing) -------------
 
 ALIF_SAMPLE = """                                          Все операции в Alif Mobi
