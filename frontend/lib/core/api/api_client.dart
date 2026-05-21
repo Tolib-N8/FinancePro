@@ -7,8 +7,12 @@ class ApiClient {
   late final Dio _dio;
 
   ApiClient({required String baseUrl, required String apiKey}) {
+    // Strip a trailing slash so "http://192.168.1.42:8000/" + "/api/v1/..."
+    // doesn't produce a double-slash path that some proxies reject.
+    final normalizedBase =
+        baseUrl.endsWith('/') ? baseUrl.substring(0, baseUrl.length - 1) : baseUrl;
     _dio = Dio(BaseOptions(
-      baseUrl: baseUrl,
+      baseUrl: normalizedBase,
       connectTimeout: const Duration(seconds: 10),
       receiveTimeout: const Duration(minutes: 2),
       sendTimeout: const Duration(minutes: 2),

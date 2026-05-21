@@ -25,6 +25,18 @@ async def health_check():
     return {"status": "ok"}
 
 
+@app.get("/")
+async def root():
+    """Discovery endpoint — open in a browser to confirm the server is reachable."""
+    return {
+        "name": "FinancePro API",
+        "version": app.version,
+        "status": "ok",
+        "docs": "/docs" if settings.debug else None,
+        "auth": "Bearer token in Authorization header (APP_API_KEY)",
+    }
+
+
 # Routers — registered after imports to avoid circular deps
 from app.routers import (  # noqa: E402
     accounts,
