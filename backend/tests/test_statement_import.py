@@ -155,6 +155,48 @@ def test_parse_json_no_json_raises():
         raise AssertionError("expected JSONDecodeError")
 
 
+# ---- _parse_alif_text (deterministic PDF text-layer parsing) -------------
+
+ALIF_SAMPLE = """                                          Все операции в Alif Mobi
+
+            Период:                       01.01.2026 — 08.04.2026
+
+          ID           Приход    Расход    Комиссия   Валюта    Дата       Описание      Отправитель      Получатель
+                                                          22.1.2026   Перевод от
+   302380009          100.00      0         0.00      TJS                               +992919177778   +992200000088
+                                                           10 12.15   +992919177778
+                                                          22.1.2026
+   302437606            0        99.00      0.99      TJS              Эсхата Онлайн   444***VSA**9421     114117117
+                                                           13 01.09
+                                                          30.1.2026
+   305094116            0        5.00       0.00      TJS                  Tcell       444***VSA**9421    114117222
+"""
+
+
+def test_parse_alif_text_extracts_transactions():
+    entries = sis._parse_alif_text(ALIF_SAMPLE)
+    assert len(entries) == 3
+
+    assert entries[0].date == date(2026, 1, 22)
+    assert entries[0].tx_type == "income"
+    assert entries[0].amount == 100.0
+    assert entries[0].currency == "TJS"
+    assert "Перевод" in entries[0].description
+
+    assert entries[1].tx_type == "expense"
+    assert entries[1].amount == 99.0
+    assert "Эсхата" in entries[1].description
+
+    assert entries[2].tx_type == "expense"
+    assert entries[2].amount == 5.0
+    assert "Tcell" in entries[2].description
+
+
+def test_parse_alif_text_rejects_unrelated_text():
+    # No Alif header -> not this format -> empty so caller falls back to AI.
+    assert sis._parse_alif_text("just some random text\nwith no table") == []
+
+
 # ---- _tx_signature (router dedup key) ------------------------------------
 
 def test_tx_signature_normalizes_case_whitespace_amount():

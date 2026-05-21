@@ -14,7 +14,9 @@ class ApiClient {
     _dio = Dio(BaseOptions(
       baseUrl: normalizedBase,
       connectTimeout: const Duration(seconds: 10),
-      receiveTimeout: const Duration(minutes: 2),
+      // Statement import drives several Gemini calls (one per PDF page) and
+      // can legitimately run a few minutes on a large multi-page statement.
+      receiveTimeout: const Duration(minutes: 5),
       sendTimeout: const Duration(minutes: 2),
       // Default JSON for normal requests. Do NOT pin Content-Type in the
       // shared headers map — that overrides Dio's automatic

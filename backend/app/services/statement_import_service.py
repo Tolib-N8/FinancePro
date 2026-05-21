@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import re
+import subprocess
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -145,7 +146,14 @@ async def parse_statement_entries(
         if ext in {".csv", ".txt"} or content_type in TABULAR_MIME:
             entries = await _parse_tabular_statement(file_bytes, account_currency)
         elif ext == ".pdf" or content_type in PDF_MIME:
-            entries = await _parse_binary_statement_with_ai(file_bytes, "pdf", account_currency)
+            # Prefer the PDF's embedded text layer — a deterministic parse uses
+            # no AI quota at all. Fall back to Gemini vision only for scanned
+            # PDFs (no text layer) or layouts the text parser doesn't know.
+            entries = _parse_pdf_text_layer(file_bytes)
+            if not entries:
+                entries = await _parse_binary_statement_with_ai(
+                    file_bytes, "pdf", account_currency
+                )
         elif ext in {".jpg", ".jpeg", ".png", ".webp"} or content_type in IMAGE_MIME:
             entries = await _parse_binary_statement_with_ai(file_bytes, "image", account_currency)
         else:
@@ -226,26 +234,143 @@ async def _parse_text_statement_with_ai(text: str, account_currency: str) -> lis
     return _entries_from_ai_payload(data, account_currency)
 
 
+# --- Deterministic PDF text-layer parsing (no AI quota used) ---------------
+
+# Anchor row of an Alif Mobi statement: long numeric ID, then the Приход /
+# Расход / Комиссия amount columns, then a 3-letter currency code.
+_ALIF_ANCHOR_RE = re.compile(
+    r"^\s*(\d{6,})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([A-Za-z]{3})\b"
+)
+_ALIF_DATE_RE = re.compile(r"(\d{1,2}\.\d{1,2}\.\d{4})")
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    """Extract a PDF's embedded text layer via poppler's pdftotext.
+
+    Returns '' for scanned PDFs (no text layer) or if pdftotext is missing.
+    """
+    try:
+        result = subprocess.run(
+            ["pdftotext", "-layout", "-enc", "UTF-8", "-", "-"],
+            input=pdf_bytes,
+            capture_output=True,
+            timeout=30,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError) as exc:
+        logger.warning("pdftotext unavailable or failed: %s", exc)
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.decode("utf-8", errors="ignore")
+
+
+def _parse_alif_text(text: str) -> list[ParsedStatementEntry]:
+    """Parse an Alif Mobi statement from its extracted text layer.
+
+    The table has one transaction per multi-line block: a date line, the
+    anchor line (ID + amount columns + currency), then a time line. Returns
+    [] if the text does not look like this format.
+    """
+    lines = text.splitlines()
+
+    header_idx: int | None = None
+    for idx, line in enumerate(lines):
+        low = line.lower()
+        if "приход" in low and "расход" in low and "валюта" in low:
+            header_idx = idx
+            break
+    if header_idx is None:
+        return []
+
+    entries: list[ParsedStatementEntry] = []
+    for i in range(header_idx + 1, len(lines)):
+        anchor = _ALIF_ANCHOR_RE.match(lines[i])
+        if not anchor:
+            continue
+        _tx_id, prihod_s, rashod_s, _fee_s, currency = anchor.groups()
+
+        prihod = _parse_amount(prihod_s) or 0.0
+        rashod = _parse_amount(rashod_s) or 0.0
+        if prihod > 0:
+            amount, tx_type = prihod, "income"
+        elif rashod > 0:
+            amount, tx_type = rashod, "expense"
+        else:
+            continue
+
+        # The date sits on one of the few lines above the anchor.
+        entry_date: date | None = None
+        date_tail = ""
+        for j in range(i - 1, max(header_idx, i - 4) - 1, -1):
+            dm = _ALIF_DATE_RE.search(lines[j])
+            if dm:
+                entry_date = _parse_date(dm.group(1))
+                date_tail = lines[j][dm.end():].strip()
+                break
+        if not entry_date:
+            continue
+
+        # Description = worded text after the date, plus any worded tokens on
+        # the anchor line (skipping phone numbers, card masks and numeric IDs).
+        desc_bits: list[str] = []
+        if date_tail:
+            desc_bits.append(date_tail)
+        for token in lines[i][anchor.end():].split():
+            if token.startswith("+") or "*" in token or token.isdigit():
+                continue
+            if any(ch.isalpha() for ch in token):
+                desc_bits.append(token)
+        description = " ".join(desc_bits).strip()[:255] or "Imported from statement"
+
+        entries.append(
+            ParsedStatementEntry(
+                date=entry_date,
+                amount=amount,
+                tx_type=tx_type,
+                description=description,
+                currency=currency.upper(),
+            )
+        )
+    return entries
+
+
+def _parse_pdf_text_layer(pdf_bytes: bytes) -> list[ParsedStatementEntry]:
+    """Try to parse a PDF deterministically from its text layer (no AI).
+
+    Returns [] when the PDF has no text layer or an unrecognised layout, so
+    the caller falls back to Gemini vision.
+    """
+    text = _extract_pdf_text(pdf_bytes)
+    if not text.strip():
+        return []
+    return _parse_alif_text(text)
+
+
 async def _parse_binary_statement_with_ai(
     file_bytes: bytes,
     file_kind: str,
     account_currency: str,
 ) -> list[ParsedStatementEntry]:
     if file_kind == "pdf":
-        image_bytes = _pdf_to_jpegs(file_bytes, max_pages=8)
+        image_bytes = _pdf_to_jpegs(file_bytes, max_pages=20)
     else:
         image_bytes = [_to_jpeg(file_bytes)]
 
-    parts = []
-    for image in image_bytes:
-        parts.append(
-            {
-                "inline_data": {
-                    "mime_type": "image/jpeg",
-                    "data": base64.standard_b64encode(image).decode(),
-                }
+    # Send the whole document in ONE AI call. The free Gemini tier rate-limits
+    # aggressively (429) the moment several requests overlap, so splitting a
+    # statement into per-page calls is far slower than a single request.
+    # Truncation of a long response is handled two ways: a large output-token
+    # budget (see _call_statement_ai), and _parse_json salvaging complete rows
+    # out of a response that still got cut off.
+    parts: list[dict] = [
+        {
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": base64.standard_b64encode(image).decode(),
             }
-        )
+        }
+        for image in image_bytes
+    ]
     parts.append({"text": STATEMENT_PROMPT.format(account_currency=account_currency)})
 
     data = await _call_statement_ai(parts)
@@ -443,12 +568,42 @@ def _pdf_to_jpegs(pdf_bytes: bytes, max_pages: int = 8) -> list[bytes]:
     return output
 
 
+def _salvage_transactions(text: str) -> list[dict]:
+    """Pull every complete JSON object out of a possibly-truncated array.
+
+    When a long Gemini response is cut off at maxOutputTokens the outer JSON
+    never closes, so a strict parse fails. The individual transaction objects
+    before the cut are still valid — extract those rather than losing the
+    whole import.
+    """
+    decoder = json.JSONDecoder()
+    objects: list[dict] = []
+    i = text.find("[")
+    if i < 0:
+        return objects
+    i += 1
+    while i < len(text):
+        while i < len(text) and text[i] in " \t\r\n,":
+            i += 1
+        if i >= len(text) or text[i] != "{":
+            break
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            break
+        if isinstance(obj, dict):
+            objects.append(obj)
+        i = end
+    return objects
+
+
 def _parse_json(text: str) -> dict:
     """Extract the first JSON object/array from an LLM response.
 
     Gemini sometimes returns the JSON wrapped in ```json fences, prefixed with
     chatter, or followed by trailing tokens. We strip code fences and use
-    raw_decode so trailing characters don't break parsing.
+    raw_decode so trailing characters don't break parsing. If the response was
+    truncated mid-array, salvage the complete transaction objects.
     """
     cleaned = text.strip()
     if "```" in cleaned:
@@ -469,7 +624,19 @@ def _parse_json(text: str) -> dict:
     )
     if start < 0:
         raise json.JSONDecodeError("No JSON object found in response", cleaned, 0)
-    obj, _ = decoder.raw_decode(cleaned[start:])
+
+    try:
+        obj, _ = decoder.raw_decode(cleaned[start:])
+    except json.JSONDecodeError:
+        # Response was likely truncated — recover the rows parsed so far.
+        salvaged = _salvage_transactions(cleaned[start:])
+        if salvaged:
+            logger.warning(
+                "Statement JSON truncated — salvaged %d transaction rows", len(salvaged)
+            )
+            return {"transactions": salvaged}
+        raise
+
     if isinstance(obj, list):
         return {"transactions": obj}
     if not isinstance(obj, dict):
@@ -479,9 +646,11 @@ def _parse_json(text: str) -> dict:
 
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=8), reraise=False)
 async def _call_statement_ai(parts: list[dict]) -> dict:
+    # 32k output headroom so a dense page of transactions is never truncated
+    # mid-JSON (which would surface as a JSONDecodeError).
     text = await generate(
         parts,
-        max_tokens=8192,
+        max_tokens=32768,
         temperature=0,
         response_mime_type="application/json",
     )

@@ -110,12 +110,18 @@ async def import_statement(
         )
     )
 
+    # Signatures of transactions already in the DB — used to skip rows when the
+    # same statement is imported twice. We deliberately do NOT add freshly
+    # imported rows back into this set: a single statement can legitimately
+    # contain several transactions with an identical date/type/amount/
+    # description (each a distinct bank operation), and those must all import.
     existing_signatures = {
         _tx_signature(tx.date, tx.type, float(tx.amount), tx.currency, tx.description)
         for tx in existing_result.scalars().all()
     }
 
     imported: list[StatementImportSample] = []
+    to_categorize: list[tuple[uuid.UUID, str, float]] = []
     skipped_duplicates = 0
 
     for entry in entries:
@@ -143,7 +149,6 @@ async def import_statement(
                 is_recurring=False,
             ),
         )
-        existing_signatures.add(signature)
         imported.append(
             StatementImportSample(
                 date=entry.date,
@@ -154,12 +159,12 @@ async def import_statement(
             )
         )
         if entry.description:
-            background_tasks.add_task(
-                _categorize_transaction,
-                tx.id,
-                entry.description,
-                entry.amount,
-            )
+            to_categorize.append((tx.id, entry.description, entry.amount))
+
+    # One batched categorization task for the whole import — firing a separate
+    # AI call per row would saturate the Gemini rate limit (429 storm).
+    if to_categorize:
+        background_tasks.add_task(_categorize_imported, to_categorize)
 
     return StatementImportResult(
         account_id=account_id,
@@ -187,7 +192,8 @@ def _tx_signature(
     )
 
 
-async def _categorize_transaction(tx_id: uuid.UUID, description: str, amount: float) -> None:
-    from app.ai.categorizer import categorize_and_save
+async def _categorize_imported(items: list[tuple[uuid.UUID, str, float]]) -> None:
+    """Background task: categorize a whole statement import in batched AI calls."""
+    from app.ai.categorizer import categorize_batch
 
-    await categorize_and_save(tx_id, description, amount)
+    await categorize_batch(items)

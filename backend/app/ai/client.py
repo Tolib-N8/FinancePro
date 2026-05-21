@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 import httpx
@@ -11,6 +12,11 @@ from tenacity import (
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Cap concurrent Gemini calls. The free tier rate-limits hard (429) once a few
+# requests overlap — e.g. a statement import plus its categorization backlog.
+# Serializing to 2 keeps throughput steady instead of triggering a 429 storm.
+_gemini_semaphore = asyncio.Semaphore(2)
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 FLASH = "gemini-2.5-flash"
@@ -46,10 +52,11 @@ def _is_transient(exc: BaseException) -> bool:
 )
 async def _post_gemini(url: str, body: dict) -> dict:
     """POST to Gemini with backoff retry on transient (429/5xx/network) errors."""
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(url, json=body)
-        r.raise_for_status()
-        return r.json()
+    async with _gemini_semaphore:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(url, json=body)
+            r.raise_for_status()
+            return r.json()
 
 
 async def generate(
