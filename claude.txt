@@ -1,1 +1,1 @@
-claude --resume "financepro-platform-setup"
+claude --resume 62124e78-c597-477d-bf9f-b5600a7061e2
